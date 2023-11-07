@@ -1,0 +1,253 @@
+---
+title: "CODEX data analysis: Spatial interactions"
+output: html_notebook
+---
+
+
+## load python env
+```{r}
+# Necessary for scimap
+reticulate::use_virtualenv("venv_scimap/", required=TRUE)
+```
+
+```{r,message=F,warning=F}
+# remotes::install_github("satijalab/seurat", "feat/imaging")
+# remotes::install_github("mojaveazure/seurat-disk")
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(stringi)
+library(uwot)
+library(patchwork)
+library(readxl)
+library(stringr)
+library(tidyr)
+library(gridExtra)
+library(data.table)
+library(reticulate)
+source("~/script/maxime.utils.r")
+source("utils/R_utils.R")
+```
+
+```{r}
+sobj<- readRDS('Path_to_saved_object_3.rds')
+```
+
+```{r}
+sobj <- AddMetaData(sobj,sobj@reductions$umap@cell.embeddings[,1],"umap_1")
+sobj <- AddMetaData(sobj,sobj@reductions$umap@cell.embeddings[,2],"umap_2")
+meta_df <- sobj@meta.data
+ad <- anndata::AnnData(obs=meta_df,shape = dim(meta_df))
+```
+
+this chunk has to be run first
+```{python}
+import numpy as np
+print("Numpy needs to be imported in this chunk for some reason")
+```
+
+## python code for spatial interactions
+```{python}
+import anndata as ad
+import pandas as pd
+import scimap as sm
+
+adata = r.ad
+```
+## Compute distance
+```{python}
+adata = sm.tl.spatial_distance (adata,
+                               x_coordinate='x', y_coordinate='y',
+                               z_coordinate=None,
+                               phenotype='ann_v3',
+                               subset=None,
+                               imageid='orig.ident',
+                               label='spatial_distance')
+```
+
+## compute spatial interactions
+```{python}
+adata = sm.tl.spatial_interaction (adata, 
+                                  method='radius', 
+                                  x_coordinate='x', y_coordinate='y', 
+                                  z_coordinate=None, 
+                                  phenotype='ann_v3', 
+                                  imageid='orig.ident', 
+                                  radius=30, 
+                                  label='spatial_interaction_radius')
+```
+
+## Generate video from spatial coords to umap
+```{python}
+#sm.hl.animate (ad_with_obs, color='cell_population',embedding='X_umap',x_coordinate='x', y_coordinate='y',subset=['P02_BL'],figsize=(20,20),n_frames=500,final_frame=20,alpha=0.5,watermark=False,
+#               save_animation = 'res/animate')
+```
+
+## Measure Pscore between CD4 T cells and CD8 T cells
+```{python}
+adata = sm.tl.spatial_pscore(adata,
+                               proximity= ['CD4_T_cells','CD8_T_cells'],
+                               score_by = 'orig.ident',
+                               imageid='orig.ident', 
+                               x_coordinate='x', y_coordinate='y', 
+                               phenotype='annotation',
+                               method='radius',
+                               radius=30,
+                               label='spatial_pscore')
+```
+
+Plot Pscores
+```{python}
+import matplotlib.pyplot as plt
+plt.figure(figsize=(10, 5))
+sm.pl.spatial_pscore (adata, color='Black', plot_score='Proximity Density')
+plt.show()
+```
+
+## Get spatial interactions back into R
+```{r}
+py$adata
+interactions <- as.data.frame(py$adata$uns$spatial_interaction_radius)
+dists <-  as.data.frame(py$adata$uns$spatial_distance)
+
+sobj@misc$interactions <- interactions
+sobj@misc$dists <- dists
+```
+
+## Interactions between all samples
+--> specfic to my project, could be useful for other projects
+```{r,fig.height=15,fig.width=15}
+library(pheatmap)
+#extract spatial interactions from object
+
+pheno_list <- setdiff(unique(interactions$phenotype),c("all_neg","Autofluo","other"))
+BL <- unique(sobj$orig.ident[sobj$timepoint_s == "BL"])
+
+int_avg <- sapply(pheno_list,function(pop){
+  int_df <- interactions[interactions$phenotype==pop,c("phenotype","neighbour_phenotype",BL)]
+  int_df <- int_df[match(pheno_list,int_df$neighbour_phenotype,),BL]
+  rowMeans(int_df,na.rm = T)
+})
+rownames(int_avg) <- pheno_list
+
+#summarize spatial interactions for all images
+int_pval <- sapply(pheno_list,function(pop){
+  int_p <- interactions[interactions$phenotype==pop,c("phenotype","neighbour_phenotype",paste0('pvalue_',BL))]
+  int_p <- int_p[match(pheno_list,int_p$neighbour_phenotype,),paste0('pvalue_',BL)]
+  rowMeans(int_p,na.rm = T)
+})
+rownames(int_pval) <- pheno_list
+interactions_signif <- gtools::stars.pval(int_pval)
+
+pheatmap(int_avg,scale = 'none',na_col = "white",display_numbers =interactions_signif, cluster_rows = F,main = "All samples: Averages BL",
+         fontsize = 20,cluster_cols = F,cellwidth = 25,cellheight = 25,color = hcl.colors(palette = "Blue-Red 2",200),angle_col = 45,breaks = seq(-1,1,0.01))
+
+```
+
+# Interactions Carbo C2
+```{r,fig.height=16,fig.width=16}
+library(pheatmap)
+#extract spatial interactions from object
+pheno_list <- setdiff(unique(interactions$phenotype),c("all_neg","Autofluo","other"))
+C2_Carbo <- unique(sobj$orig.ident[sobj$timepoint_s != "BL" & sobj$Tx=="Carboplatin"])
+
+int_avg <- sapply(pheno_list,function(pop){
+  int_df <- interactions[interactions$phenotype==pop,c("phenotype","neighbour_phenotype",C2_Carbo)]
+  int_df <- int_df[match(pheno_list,int_df$neighbour_phenotype,),C2_Carbo]
+  rowMeans(int_df,na.rm = T)
+})
+rownames(int_avg) <- pheno_list
+
+#summarize spatial interactions for all images
+int_pval <- sapply(pheno_list,function(pop){
+  int_p <- interactions[interactions$phenotype==pop,c("phenotype","neighbour_phenotype",paste0('pvalue_',C2_Carbo))]
+  int_p <- int_p[match(pheno_list,int_p$neighbour_phenotype,),paste0('pvalue_',C2_Carbo)]
+  rowMeans(int_p,na.rm = T)
+})
+rownames(int_pval) <- pheno_list
+interactions_signif <- gtools::stars.pval(int_pval)
+
+pheatmap(int_avg,scale = 'none',na_col = "white",display_numbers =interactions_signif, cluster_rows = F,main = "Carboplatin: Averages C2",
+         fontsize = 20,cluster_cols = F,cellwidth = 25,cellheight = 25,color = hcl.colors(palette = "Blue-Red 2",200),angle_col = 45,breaks = seq(-1,1,0.01))
+
+```
+
+## Annotation colors
+```{r}
+rep_colors <- hcl.colors(palette = 'Temps',5,rev=T)[c(1,3,4,5)]
+ann_colors = list(
+  Tx= c('Carboplatin'="#FDC086",
+        "Carboplatin + Nivolumab"="#386CB0"),
+  Response = c(CR=rep_colors[4],
+               PR=rep_colors[3],
+               SD=rep_colors[2],
+               PD=rep_colors[1]),
+  Evaluation=c(Excellent=rep_colors[4],Poor=rep_colors[1]),
+  timepoint=c(BL="white",
+              C2='lightblue',
+              C3="royalblue1",
+              EOT="darkblue"))
+```
+
+## Visualize all interactions
+```{r,fig.height=8,fig.width=25}
+pheno_list <- setdiff(unique(interactions$phenotype),c("all_neg","Autofluo","other"))
+all_sample<- unique(sobj$orig.ident)
+interactions <- interactions[interactions$phenotype %in% pheno_list ,]
+interactions <- interactions[interactions$neighbour_phenotype %in% pheno_list ,]
+
+#Order : 
+# timepoint / TX / Evaluation 
+BL_C_E <- unique(sobj$orig.ident[sobj$timepoint_s == "BL" & sobj$Tx == "Carboplatin" & sobj$Evaluation=="Excellent"])
+BL_C_P <- unique(sobj$orig.ident[sobj$timepoint_s == "BL" & sobj$Tx == "Carboplatin" & sobj$Evaluation=="Poor"])
+
+C2_C_E <- unique(sobj$orig.ident[sobj$timepoint_s != "BL" & sobj$Tx == "Carboplatin" & sobj$Evaluation=="Excellent"])
+C2_C_P <- unique(sobj$orig.ident[sobj$timepoint_s != "BL" & sobj$Tx == "Carboplatin" & sobj$Evaluation=="Poor"])
+
+BL_CN_E <- unique(sobj$orig.ident[sobj$timepoint_s == "BL" & sobj$Tx == "Carboplatin + Nivolumab" & sobj$Evaluation=="Excellent"])
+BL_CN_P <- unique(sobj$orig.ident[sobj$timepoint_s == "BL" & sobj$Tx == "Carboplatin + Nivolumab" & sobj$Evaluation=="Poor"])
+
+C2_CN_E <- unique(sobj$orig.ident[sobj$timepoint_s != "BL" & sobj$Tx == "Carboplatin + Nivolumab" & sobj$Evaluation=="Excellent"])
+C2_CN_P <- unique(sobj$orig.ident[sobj$timepoint_s != "BL" & sobj$Tx == "Carboplatin + Nivolumab" & sobj$Evaluation=="Poor"])
+
+int_all <- interactions[,c(BL_C_P,BL_CN_P,
+                           BL_C_E,BL_CN_E,
+                           C2_C_P,C2_CN_P,
+                           C2_C_E,C2_CN_E)]
+rownames(int_all) <- paste0(interactions$phenotype, "->",interactions$neighbour_phenotype)
+
+#remove self interaction
+int_all <- int_all[interactions$phenotype != interactions$neighbour_phenotype,]
+ann_pheatmap <- sapply(all_sample, function(x) {
+  rowdf <- sobj@meta.data[sobj@meta.data$orig.ident == x, c('Tx', 'Evaluation', 'Response', 'timepoint')][1, ]
+  # Converting factor columns to character type
+  rowdf$Evaluation <- as.character(rowdf$Evaluation)
+  rowdf$Response <- as.character(rowdf$Response)
+  return(unlist(rowdf))
+})
+
+# Transposing and then converting to a dataframe with stringsAsFactors set to FALSE
+ann_pheatmap <- as.data.frame(t(as.data.frame(ann_pheatmap)), stringsAsFactors = FALSE)
+
+pheatmap(t(int_all),scale = 'none',na_col = "white",
+         #display_numbers =interactions_signif, 
+         cluster_rows = F,cluster_cols = F,
+         main = "All samples: Averages",
+         annotation_row = ann_pheatmap,annotation_colors = ann_colors,
+         fontsize = 5,cellwidth = 5,cellheight = 10,
+         color = pals::coolwarm(200),
+         angle_col = 90,gaps_row = seq(0,39,5))
+```
+
+## Distances 
+```{r,fig.height=7,fig.width=7}
+average_dists <- sapply(pheno_list,function(pop){
+  print(pop)
+  ids <- which(sobj$annotation==pop)
+  mns <- colMeans(sobj@misc$dists[ids,],na.rm=T)
+})
+colnames(average_dists) <- rownames(average_dists)
+average_dists <- average_dists[pheno_list,pheno_list]
+#average_dists <- scale(as.data.frame(average_dists))
+pheatmap(average_dists,scale = "row",cluster_rows = F,cluster_cols = F,cellwidth = 20,cellheight = 20,na_col = "white",color = rev(pals::coolwarm(100)),angle_col = 45)
+```

@@ -1,0 +1,193 @@
+---
+title: "CODEX data analysis: Cellular neighborhoods"
+output:
+  html_document:
+    df_print: paged
+---
+
+## load python env
+```{r}
+reticulate::use_virtualenv("venv_scimap/", required=TRUE)
+library(reticulate)
+```
+
+```{r,message=F,warning=F,eval=T}
+library(Seurat)
+library(ggplot2)
+library(viridis)
+library(dplyr)
+library(reshape2)
+library(uwot)
+library(pals)
+library(pheatmap)
+library(dbscan)
+library(patchwork)
+library(wesanderson)
+source("~/script/maxime.utils.r")
+source("utils/R_utils.R")
+
+```
+
+## Load annotated and cleaned data
+
+```{r,eval=T}
+sobj<- readRDS('Path_to_saved_object_2.rds')
+```
+
+
+## Function to find neighborhoods for seurat object
+```{r}
+#### Main parameters to define #####
+k <- 20                                           #number of cell neighbors 
+n_neighborhoods <- 10                             #number of neighborhoods
+group_var = 'orig.ident'                          #sample information
+cell_pop_var="ann_v3"                             #cell annotation
+pop_to_exclude = c("Autofluo","all_neg" ,"other") #cell annotation to not consider for clustering (will be included for nearest neighbor identification)
+################################### 
+
+set.seed(8)
+sobj <- find_neighborhoods_V2(sobj = sobj,
+                           cell_pop_var = cell_pop_var,
+                           group_var = group_var,
+                           pop_to_exclude <- pop_to_exclude,
+                           k = k,
+                           n_neighborhoods = n_neighborhoods)
+```
+
+```{r}
+df <- data.frame(sobj$neighborhoods)
+colnames(df)<- 'cellular_neighborhoods'
+df$sample <- sobj$orig.ident
+clusters <- as.character(unique(sobj$neighborhoods))
+clusters <- setdiff(clusters[order(nchar(clusters), clusters)],"none")
+n_neighborhoods <- length(clusters)
+neighborhoods_colors <- pals::coolwarm(n_neighborhoods)
+neighborhoods_colors <- wes_palette("Darjeeling1",n = n_neighborhoods,type = "continuous")
+```
+
+## Heatmap of neighborhoods
+```{r,fig.width=7,fig.height=8,dpi=300}
+annot <- sapply(clusters,function(x){
+  w <- colnames(sobj)[which(sobj$neighborhoods==x)]
+  100*(colSums(sobj@misc$nearest_neihgbors[w,]) / sum(colSums(sobj@misc$nearest_neihgbors[w,])))
+})
+#Define colors and annotations
+names(neighborhoods_colors) <- clusters
+anno_colors <- list(neighborhoods = neighborhoods_colors)
+annotation <- data.frame(neighborhoods = factor(clusters))
+colnames(annot) <- clusters
+rownames(annotation) <- colnames(annot) 
+breaksList = seq(-2, 2, by = 0.1)
+
+pheatmap(annot,
+         scale = 'none',
+         show_colnames = T,
+         display_numbers = T,
+         number_color = 'white',treeheight_col = 1,treeheight_row = 1,
+         angle_col = 90,
+         color = hcl.colors(palette = 'SunsetDark',100),
+         number_format = "%1.0f",
+         #fontsize = 5,
+         cellheight = 10,cellwidth = 20,
+         show_rownames = T,
+         annotation = annotation,
+         annotation_legend = F,
+         annotation_colors = anno_colors,
+         )
+pheatmap(annot,
+         scale = 'row',
+         show_colnames = T,
+         display_numbers = F,
+         number_color = 'white',treeheight_col = 1,treeheight_row = 1,
+         angle_col = 45,
+         color=colorRampPalette(hcl.colors(palette = 'Blue-Red',length(breaksList),rev = F))(length(breaksList)),
+         #color = hcl.colors(palette = 'SunsetDark',100),
+         #number_format = "%1.0f",
+         #fontsize = 5,
+         cellheight = 10,cellwidth = 20,
+         show_rownames = T,
+         annotation = annotation,
+         breaks = breaksList,
+         annotation_legend = F,
+         annotation_colors = anno_colors,
+         )
+```
+
+## Quantify neighborhoods per region
+```{r,eval=F,fig.width=12,fig.height=5}
+
+counts <- group_by(df, cellular_neighborhoods, sample) %>% summarise(count = n())
+counts$percentage <- round(counts$count/ rowSums(table(df$sample,df$cellular_neighborhoods))[counts$sample] *100)
+
+ggplot(counts, aes(fill=cellular_neighborhoods, y=percentage, x=sample)) + 
+  geom_bar(position="fill", stat="identity",width = 0.75) +
+  #geom_text(aes(label = percentage), position = position_fill(vjust = 0.5, reverse= F))+
+  scale_fill_manual(values = neighborhoods_colors,
+                    breaks = clusters)+
+  theme_light()+ 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=0.4))+
+  theme(axis.title.x=element_blank(),
+        #axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+```
+
+## Plot neighborhoods
+```{r,fig.width=10,fig.height=10,dpi=300}
+
+region_ids<- unique(sobj$orig.ident)
+plots <- lapply(region_ids,function(r_id){
+  #print(r_id)
+  coords<- data.frame(cbind(sobj$x[sobj$orig.ident==r_id],
+                            sobj$y[sobj$orig.ident==r_id],
+                            sobj$neighborhoods[sobj$orig.ident==r_id]))
+  colnames(coords) <- c("x",'y','neighborhoods')
+  coords$x <- as.numeric(coords$x)
+  coords$y <- as.numeric(coords$y)
+  coords$neighborhoods <- coords$neighborhoods
+  p <- ggplot(coords,aes(x=x,y=y,color=neighborhoods))+
+    geom_point(size=0.5,alpha=0.7)+
+    scale_color_manual(values = as.character(neighborhoods_colors),
+                       breaks = as.character(clusters))+
+    ggtitle(r_id) +
+    theme_classic() + 
+    scale_y_reverse() +
+    #NoAxes()+
+    theme(legend.position="bottom") +
+    guides(color = guide_legend(override.aes = list(size = 3,alpha=1)))+
+    coord_fixed()
+  p
+})
+plots[c(1,2,8,9,14,15,18,19)]
+gridExtra::grid.arrange(grobs=plots[c(1,2,8,9)])
+gridExtra::grid.arrange(grobs=plots[c(14,15,18,19)])
+
+```
+
+## Save object
+```{r}
+saveRDS(sobj,'Path_to_saved_object_3.rds')
+```
+
+## Write h5ad for Tissuumaps
+```{r}
+library(anndata)
+
+t1 <- Sys.time()
+paths <- "/n/data2/dfci/cancerimm/wucherpfennig/graham/personal/tissuumap_test/ye/"
+for(x in unique(sobj$orig.ident)){
+  meta_df <- sobj@meta.data[sobj$orig.ident == x ,]
+  #x_mat <-  t(sobj@assays$zscores@counts[,sobj$orig.ident == x])
+  ad <- anndata::AnnData(obs=meta_df,shape = dim(meta_df))
+  path_to_save <- paste0(paths,x,"/seurat_tmap.h5ad")
+  suppressMessages(anndata::write_h5ad(anndata = ad,filename = path_to_save))
+}
+t2 <- Sys.time()
+t2-t1
+```
+
+#copy paste this command in the terminal
+```{bash,eval=F}
+source activate /n/data2/dfci/cancerimm/wucherpfennig/graham/conda_envs/anndata_utils/
+cd /n/data2/dfci/cancerimm/wucherpfennig/tools/CODEX_scripts/utils/
+python search_save_h5ad.py /n/data2/dfci/cancerimm/wucherpfennig/graham/personal/tissuumap_test/ye/
+```

@@ -1,0 +1,503 @@
+---
+title: "CODEX data analysis: Unsupervised clustering"
+output:
+  html_document:
+    df_print: paged
+---
+
+## load python env
+```{r}
+# Requires python virtual environment for the leiden package
+reticulate::use_virtualenv("venv_scimap/", required=TRUE)
+```
+
+## Load libraries and functions
+
+```{r,message=F,warning=F}
+# remotes::install_github("satijalab/seurat", "feat/imaging")
+# remotes::install_github("mojaveazure/seurat-disk")
+library(Seurat)
+library(ggplot2)
+library(reticulate)
+library(viridis)
+library(dplyr)
+library(stringi)
+library(ClusterR)
+library(uwot)
+library(patchwork)
+source("utils/R_utils.R")
+
+```
+
+## Load aggregated and cleaned object
+```{r,cache=F}
+sobj<- readRDS('Path_to_saved_object.rds')
+```
+
+## Number of threads
+```{r}
+n_threads <- 10
+```
+
+## Define structural markers
+```{r,cache=F}
+struc_markers <- c('CD3e',"CD4","CD8","CD56","DC-LAMP","HLA-DR","Podoplanin",'CD20','CD31','CD68',"CD163",'CD66b',
+                  'Pancytokeratin',"E-Cadherin","Vimentin","N-Cadherin","SLUG","FAP","Blank-1")
+struc_markers <- paste0(struc_markers,"-nuc")
+```
+
+
+## Perform Kmeans and subset for low dimension umap
+```{r,eval=T,cache=F}
+sobj_counts<-as.matrix(t(sobj@assays$zscores@counts[struc_markers,]))
+kmc_emb<- MiniBatchKmeans(data = sobj_counts, # now performing kmeans on struct markers as well
+                      batch_size = 100000, # making sure to get cells of interest
+                      clusters = 200,
+                      max_iters = 150,
+                      seed = 8
+                        )
+kmc <- predict(kmc_emb,newdata = sobj_counts)
+sobj <- AddMetaData(sobj,col.name = "kmc",metadata = factor(kmc))
+Idents(object = sobj) <- factor(kmc)
+sobj_small <- subset(sobj, downsample = 3000,idents =unique(kmc)) #subset 600k cells
+
+```
+
+```{r,eval=T,cache=F}
+train_df <- data.frame(t(sobj_small@assays$zscores@counts[struc_markers,]))
+```
+
+```{r}
+k=30
+```
+## Run initial umap
+
+These next steps are dedicated to finding best values of a and b for the umap, they are therefore set as eval=F once a and b have been found
+```{r,eval=F}
+# t-UMAP is equivalent to a = 1, b = 1
+# remember to get the nearest neighbor data back too
+k=30
+init_a1b1 <- tumap(train_df, ret_nn = TRUE,metric = "cosine",n_neighbors = k,batch = TRUE,fast_sgd=T,n_sgd_threads = n_threads,n_threads = n_threads)
+```
+
+## Determine best umap parameters
+```{r,fig.height=7,fig.width=10,eval=F}
+# find a
+b<-0.7
+a_vals <- c(5,3,2,1)
+a_res <- lapply(a_vals,function(a){
+  print(a)
+  train_umap_2D <- umap(train_df, nn_method = init_a1b1$nn, a = a, b = b,
+                   batch = TRUE,
+                   fast_sgd=T,
+                   n_neighbors = k, #50 was ok
+                   metric = "cosine",
+                   n_sgd_threads = n_threads,
+                   n_threads = n_threads)
+  embeddings_train_2D <- as.matrix(train_umap_2D)
+  colnames(embeddings_train_2D) <- paste0("UMAP_", 1:2)
+  sobj_small@reductions[["umap"]] <- CreateDimReducObject(embeddings = embeddings_train_2D, key = "UMAP_", assay = DefaultAssay(sobj_small))
+  # Quick look at the umap
+  pl <- DimPlot(sobj_small,reduction = 'umap',group.by = 'orig.ident')+ ggtitle(paste0("a=",a," b=",b)) + NoLegend() + NoAxes() + coord_fixed()
+  pl[[1]]$layers[[1]]$aes_params$alpha <- .5
+  pl
+})
+# find b based on whichever value of a you prefer
+# a = 3 is not bad
+a <- 3
+b_vals <- seq(from=0.5,to=0.8,by=0.05)
+b_res <- lapply(b_vals,function(b){
+  print(b)
+  train_umap_2D <- umap(train_df, nn_method = init_a1b1$nn, a = a, b = b,
+                   batch = TRUE,
+                   fast_sgd=T,n_neighbors = k,
+                   metric = "cosine",
+                   n_sgd_threads = n_threads,
+                   n_threads = n_threads)
+  embeddings_train_2D <- as.matrix(train_umap_2D)
+  colnames(embeddings_train_2D) <- paste0("UMAP_", 1:2)
+  sobj_small@reductions[["umap"]] <- CreateDimReducObject(embeddings = embeddings_train_2D, key = "UMAP_", assay = DefaultAssay(sobj_small))
+  # Quick look at the umap
+  pl <- DimPlot(sobj_small,reduction = 'umap',group.by = 'orig.ident')+ ggtitle(paste0("a=",a," b=",b)) + NoLegend() + NoAxes() + coord_fixed()
+  pl[[1]]$layers[[1]]$aes_params$alpha <- .5
+  pl
+})
+a_res <- lapply(a_res,function(x){
+  x$layers[[1]]$geom_params$pointsize <- 1
+  x
+})
+b_res <- lapply(b_res,function(x){
+  x$layers[[1]]$geom_params$pointsize <- 1
+  x
+})
+wrap_plots(a_res,ncol=4)
+wrap_plots(b_res,ncol=4)
+```
+
+## Learn Umap with identified parameters (need to re-learn it to get the model)
+```{r,cache=F}
+set.seed(8)
+train_umap_2D <- umap(train_df,
+                   batch = TRUE,
+                   fast_sgd=T,
+                   n_sgd_threads = n_threads,
+                   n_threads = n_threads,
+                   ret_model = TRUE,
+                   ret_extra = c("nn",'fgraph'),
+                   n_neighbors =k,# check option to set off for clustering
+                   verbose = T,
+                   n_components = 2,
+                   a=3,b=0.6, # a=3,b=0.6 give more spread out results
+                   metric = 'cosine')
+#Add 2D umap to subset seurat object
+embeddings_train_2D <- as.matrix(train_umap_2D$embedding)
+colnames(embeddings_train_2D) <- paste0("UMAP_", 1:2)
+sobj_small@reductions[["umap"]] <- CreateDimReducObject(embeddings = embeddings_train_2D, key = "UMAP_", assay = DefaultAssay(sobj_small))
+#Quick look at the umap
+pl <- DimPlot(sobj_small,reduction = 'umap',group.by = 'orig.ident',pt.size = 1,shuffle = T)
+pl[[1]]$layers[[1]]$aes_params$alpha <- .5
+pl
+```
+## clean memory before clustering
+```{r}
+gc()
+Sys.sleep(5)
+```
+
+## Run Leiden clsutering
+```{r,fig.height=8,fig.width=8,cache=F}
+
+# leiden modularity partition on fgraph
+options(scipen = 1000000000)
+t0 <- Sys.time()
+leiden_modul <- suppressMessages(suppressWarnings(leiden::leiden(train_umap_2D$fgraph,
+                                                         resolution_parameter=1.8,
+                                                         seed = 1,
+                                                         partition_type ="ModularityVertexPartition")))
+t1 <- Sys.time()
+print(round(t1-t0))
+sobj_small<- AddMetaData(sobj_small,factor(leiden_modul),col.name = "leiden_modularity")
+leiden_pl <- DimPlot(sobj_small,reduction = 'umap',group.by = 'leiden_modularity',label = T,label.box = T,repel=T,pt.size=1) + NoLegend() + ggtitle(paste0("leiden Modularity partition, time= ",round(t1-t0),"min")) + coord_fixed()
+sobj_small$leiden <-  sobj_small$leiden_modularity
+leiden_pl
+```
+
+## Refine leiden clusters
+```{r,fig.height=10,fig.width=20,eval=T,cache=F}
+sobj_small <- refine_labels(sobj_small,label_name = "leiden",k_neighbors = 100,n_threads = n_threads,Kmean_k = 3)
+
+plot_refined <- DimPlot(sobj_small,reduction = 'umap',group.by = 'leiden_refined',label = T,label.box = T,repel=T,pt.size=1) + NoLegend() + coord_fixed()
+plot_unrefined <- DimPlot(sobj_small,reduction = 'umap',group.by = 'leiden',label = T,label.box = T,repel=T,pt.size=1) + NoLegend() + coord_fixed()
+plot_unrefined + plot_refined
+```
+
+## Show expression of markers (zscores)
+```{r,message=F,warning=F,fig.width=20,fig.height=15,dpi=300,eval=T,cache=F}
+DefaultAssay(sobj_small) <- "zscores"
+pl <- FeaturePlot(sobj_small,
+            reduction = "umap",
+            features = struc_markers,
+            pt.size=1,
+            ncol=6) 
+pl[[1]]$layers[[1]]$aes_params$alpha <- .5
+
+# custom color scale, values below 0 are set to darkest color, values above 3 to the brightest color (red with this color palette)
+pl & scale_color_gradientn(colours = viridis::viridis(100,option='viridis'),
+                                limits = c(0, 5),
+                                oob = scales::squish) & NoLegend() & coord_fixed() & NoAxes() &DarkTheme()
+pl <- FeaturePlot(sobj_small,
+            reduction = "umap",
+            features = c("DC-LAMP-nuc","Podoplanin-nuc","HLA-DR-nuc","MHC-1-nuc"),
+            pt.size=1,
+            #cols = viridis(100,option = "turbo"),
+            ncol=2) 
+pl[[1]]$layers[[1]]$aes_params$alpha <- .5
+
+# custom color scale, values below 0 are set to darkest color, values above 3 to the brighest color (red with this color palette)
+pl & scale_color_gradientn(colours = viridis::viridis(100,option='viridis'),
+                                limits = c(0, 5),
+                                oob = scales::squish) & NoLegend() & coord_fixed() & NoAxes() &DarkTheme()
+```
+
+## Show expression of markers (MFI)
+--> adjust limits according to your data dynamic range
+```{r,message=F,warning=F,fig.width=20,fig.height=15,dpi=300,eval=T,cache=F}
+DefaultAssay(sobj_small) <- "MFI"
+pl <- FeaturePlot(sobj_small,
+            reduction = "umap",
+            features = struc_markers,
+            pt.size=1,
+            ncol=6) 
+pl[[1]]$layers[[1]]$aes_params$alpha <- .5
+
+# custom color scale, values below 0 are set to darkest color, values above 3 to the brightest color (red with this color palette)
+pl & scale_color_gradientn(colours = viridis::viridis(100,option='viridis'),
+                                limits = c(0, 250),
+                                oob = scales::squish) & NoLegend() & coord_fixed() & NoAxes() &DarkTheme()
+pl <- FeaturePlot(sobj_small,
+            reduction = "umap",
+            features = c("DC-LAMP-nuc","Podoplanin-nuc","HLA-DR-nuc","MHC-1-nuc"),
+            pt.size=1,
+            #cols = viridis(100,option = "turbo"),
+            ncol=2) 
+pl[[1]]$layers[[1]]$aes_params$alpha <- .5
+
+# custom color scale, values below 0 are set to darkest color, values above 3 to the brighest color (red with this color palette)
+pl & scale_color_gradientn(colours = viridis::viridis(100,option='viridis'),
+                                limits = c(0, 250),
+                                oob = scales::squish) & NoLegend() & coord_fixed() & NoAxes() &DarkTheme()
+```
+
+## Predict umap on the whole dataset
+```{r,fig.height=10,fig.width=10,cache=F}
+#Predict on the full dataset 
+test_df <- sobj@assays$zscores@counts[struc_markers,]
+test_umap_2D <- umap_transform(data.frame(t(test_df)),
+                               model =train_umap_2D,
+                               batch = T,
+                               n_sgd_threads = n_threads,
+                               ret_extra = c("nn"),
+                               n_threads = n_threads,
+                               verbose = TRUE)
+# Add 2D umap to full seurat object 
+colnames(test_umap_2D$embedding) <- paste0("UMAP_", 1:2)
+sobj@reductions[["umap"]] <- CreateDimReducObject(embeddings = test_umap_2D$embedding, key = "UMAP_", assay = DefaultAssay(sobj))
+#Quick look at the umap
+pl <- DimPlot(sobj,reduction = 'umap',group.by = 'orig.ident',raster.dpi = c(1080,1080),pt.size = 1 ) + coord_fixed()
+pl[[1]]$layers[[1]]$aes_params$alpha <- .5
+pl
+```
+
+## Predict leiden labels on whole dataset
+```{r,fig.height=10,fig.width=10,cache=F}
+test_labels <- predict_labels_nn(umap_test = test_umap_2D,train_labels = factor(sobj_small$leiden_refined),method = 'vote')
+sobj<- AddMetaData(sobj,factor(test_labels),col.name = "leiden")
+pl <- DimPlot(sobj,reduction = 'umap',group.by = 'leiden',label = T,label.box = T,repel=T,raster.dpi = c(1080,1080),pt.size=1) + NoLegend() + ggtitle(paste0("predicted leiden: vote")) + coord_fixed()
+#pl[[1]]$layers[[1]]$aes_params$alpha <- .5
+pl
+Idents(sobj) = "leiden"
+```
+
+## Refine leiden clusters
+```{r,fig.height=10,fig.width=20,eval=T,cache=F}
+sobj <- refine_labels(sobj,label_name = "leiden",k_neighbors = 100,n_threads = n_threads,Kmean_k = 3)
+
+plot_refined <- DimPlot(sobj,reduction = 'umap',group.by = 'leiden_refined',label = T,label.box = T,repel=T,raster.dpi = c(1080,1080),pt.size=1) + NoLegend() + coord_fixed()
+plot_refined[[1]]$layers[[1]]$aes_params$alpha <- .5
+plot_unrefined <- DimPlot(sobj,reduction = 'umap',group.by = 'leiden',label = T,label.box = T,repel=T,raster.dpi = c(1080,1080),pt.size=1) + NoLegend() + coord_fixed()
+plot_unrefined[[1]]$layers[[1]]$aes_params$alpha <- .5
+
+plot_unrefined + plot_refined
+Idents(sobj) = "leiden"
+```
+
+## Visualize umap
+```{r,fig.height=10,fig.width=20,cache=F}
+#global umap with kmeans clusters
+umap_clustering <- DimPlot(sobj,
+        label = T,label.box = T,label.size = 7,
+        group.by = 'leiden',
+        raster.dpi = c(1080,1080),pt.size=1,
+        reduction = 'umap') + ggtitle(paste0('n=',ncol(sobj),' cells')) + coord_fixed() + NoLegend()
+#sample specific umap
+umap_sample <- DimPlot(sobj,
+                       reduction = 'umap',
+                       raster.dpi = c(1080,1080),pt.size=1,
+                       group.by = 'orig.ident') + coord_fixed()
+umap_sample[[1]]$layers[[1]]$aes_params$alpha <- .7
+
+umap_clustering+ umap_sample
+```
+
+## Visualize channels
+```{r,message=F,warning=F,fig.width=20,fig.height=15,dpi=300,eval=T,cache=F}
+DefaultAssay(sobj) <- "zscores"
+pl <- FeaturePlot(sobj,
+            reduction = "umap",
+            features = struc_markers,
+            pt.size=1,
+            ncol=6) 
+pl[[1]]$layers[[1]]$aes_params$alpha <- .5
+
+# custom color scale, values below 0 are set to darkest color, values above 3 to the brightest color (red with this color palette)
+pl & scale_color_gradientn(colours = viridis::viridis(100,option='viridis'),
+                                limits = c(0, 5),
+                                oob = scales::squish) & NoLegend() & coord_fixed() & NoAxes() &DarkTheme()
+pl <- FeaturePlot(sobj,
+            reduction = "umap",
+            features = c("DC-LAMP-nuc","Podoplanin-nuc","HLA-DR-nuc","MHC-1-nuc"),
+            pt.size=1,
+            ncol=2) 
+pl[[1]]$layers[[1]]$aes_params$alpha <- .5
+
+# custom color scale, values below 0 are set to darkest color, values above 3 to the brighest color (red with this color palette)
+pl & scale_color_gradientn(colours = viridis::viridis(100,option='viridis'),
+                                limits = c(0, 5),
+                                oob = scales::squish) & NoLegend() & coord_fixed() & NoAxes() &DarkTheme()
+```
+## Visualize channels MFI
+```{r,message=F,warning=F,fig.width=20,fig.height=15,dpi=300,eval=T,cache=F}
+DefaultAssay(sobj) <- "MFI"
+pl <- FeaturePlot(sobj,
+            reduction = "umap",
+            features = struc_markers,
+            raster.dpi = c(1080,1080),pt.size = 1,
+            ncol=7) 
+pl[[1]]$layers[[1]]$aes_params$alpha <- .5
+
+# custom color scale, values below 0 are set to darkest color, values above 3 to the brightest color (red with this color palette)
+pl & scale_color_gradientn(colours = viridis::viridis(100,option='viridis'),
+                                limits = c(0, 250),
+                                oob = scales::squish) & NoLegend() & coord_fixed() & NoAxes() &DarkTheme()
+pl <- FeaturePlot(sobj,
+            reduction = "umap",
+            features = c("DC-LAMP-nuc","Podoplanin-nuc","HLA-DR-nuc","MHC-1-nuc","GZMB-nuc","GZMK-nuc"),
+            raster.dpi = c(1080,1080),pt.size = 1,
+            ncol=3) 
+pl[[1]]$layers[[1]]$aes_params$alpha <- .5
+
+# custom color scale, values below 0 are set to darkest color, values above 3 to the brighest color (red with this color palette)
+pl & scale_color_gradientn(colours = viridis::viridis(100,option='viridis'),
+                                limits = c(0, 250),
+                                oob = scales::squish) & NoLegend() & coord_fixed() & NoAxes() &DarkTheme()
+```
+## Aggregate and annotate clusters
+```{r,eval=F}
+
+annot <- list(CD8_T_cells = c(10,6),
+              CD4_T_cells = c(23,42,14),
+              B_cells = c(38,24),
+              Dendritic_cells = c(28),
+              Macrophages_CD68 = c(21,22,18,39,15,19),
+              Macrophages_CD163 = c(1),
+              Neutrophils = c(20),
+              Endothelial_cells = c(41),
+              Fibroblasts = c(34,33,35),
+              Lymphatics = c(2,40),
+              Tumor = c(36,32,25,11,27,30,17,9,29,31,26,7,8,4,3,5),
+              CD56_pop = c(16),
+              Autofluo = c(44,12,13))
+#find missing : 
+sort(unlist(annot))
+     
+sobj$annotation <- "other"
+for (i in names(annot)){
+  sobj$annotation[sobj$leiden %in% unlist(annot[i])] <- i
+}
+
+sobj$annotation <- factor(sobj$annotation,levels=c("Neutrophils","Lymphatics","B_cells","Dendritic_cells","Macrophages_CD68","Macrophages_CD163","CD8_T_cells","CD4_T_cells","CD56_pop",
+                                                   "Endothelial_cells","Fibroblasts","Tumor","Tumor_mesenchymal","Autofluo","other"))
+
+```
+
+```{r}
+saveRDS(sobj,'Path_to_saved_object_2.rds')
+```
+
+## Visualize cell population annotations
+```{r,fig.height=12,fig.width=12,eval=F}
+library(pals)
+clusters <- levels(sobj$annotation)
+set.seed(4854)
+pop_colors <- sample(as.character(pals::brewer.accent(length(clusters))))
+pop_colors <- as.character(pals::brewer.paired(length(clusters)))
+
+#change other to grey 
+oid <- grep('other',clusters)
+oifd <-  grep('Autofluo',clusters)
+# pop_colors[oid] <- 'grey'
+# pop_colors[oifd] <- 'azure3'
+
+pl <- DimPlot(sobj,
+        pt.size = 0.001,
+        raster=F,
+        repel = T,
+        label = T,
+        label.box = T,label.size = 7,
+        label.color = 'black',
+        group.by = 'annotation',
+        reduction = 'umap') + scale_color_manual(values = pop_colors,
+                       breaks = clusters) + coord_fixed() + NoLegend() + scale_fill_manual(values = pop_colors,breaks = clusters)
+pl[[1]]$layers[[1]]$aes_params$alpha <- .4
+pl
+```
+
+## Visualize sample composition
+```{r,eval=F,fig.width=12,fig.height=6}
+df <- data.frame(sobj$annotation)
+colnames(df)<- 'annotation'
+df$sample <- sobj$orig.ident
+
+counts <- group_by(df, annotation, sample) %>% summarise(count = n())
+
+# Stacked + percent
+ggplot(counts, aes(fill=annotation, y=count, x=sample)) + 
+  geom_bar(position="fill", stat="identity") +
+  scale_fill_manual(values = pop_colors,
+                    breaks = clusters)+
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.5, hjust=1),axis.title.x = element_blank())
+```
+## Visualize umap split by sample
+```{r,fig.height=20,fig.width=30,eval=F,dpi=300}
+DimPlot(sobj,
+        split.by = 'orig.ident',
+        group.by = 'cell_population',
+        pt.size = 0.01,
+        #cols=colors,
+        raster = F,
+        ncol=8,
+        reduction = "spatial_") &
+  theme(legend.position="bottom") & 
+  coord_fixed() &
+  NoAxes() &
+  scale_y_reverse() &
+  scale_color_manual(values = pop_colors,
+                     breaks = clusters)
+```
+
+## Visualize umap for specific sample
+```{r,fig.height=20,fig.width=20,eval=F,dpi=500}
+
+DimPlot(sobj,
+        cells = names(which(sobj$orig.ident == 'P02_BL')),
+        group.by = 'annotation',
+        raster = F,
+        reduction = "spatial_") &
+  theme(legend.position="bottom") & 
+  coord_fixed() &
+  NoAxes() &
+  scale_y_reverse() &
+  scale_color_manual(values = pop_colors,
+                     breaks = clusters)
+DimPlot(sobj,
+        cells = names(which(sobj$orig.ident == 'P02_C2')),
+        group.by = 'annotation',
+        raster = F,
+        reduction = "spatial_") &
+  theme(legend.position="bottom") & 
+  coord_fixed() &
+  NoAxes() &
+  scale_y_reverse() &
+  scale_color_manual(values = pop_colors,
+                     breaks = clusters)
+```
+
+## Write h5ad for Tissuumaps
+```{r}
+library(anndata)
+
+t1 <- Sys.time()
+paths <- "tissuumap_folder"
+for(x in unique(sobj$orig.ident)){
+  meta_df <- sobj@meta.data[sobj$orig.ident == x ,]
+  #x_mat <-  t(sobj@assays$zscores@counts[,sobj$orig.ident == x])
+  ad <- anndata::AnnData(obs=meta_df,shape = dim(meta_df))
+  path_to_save <- paste0(paths,x,"/seurat_tmap.h5ad")
+  suppressMessages(anndata::write_h5ad(anndata = ad,filename = path_to_save))
+}
+t2 <- Sys.time()
+t2-t1
+```
+
+

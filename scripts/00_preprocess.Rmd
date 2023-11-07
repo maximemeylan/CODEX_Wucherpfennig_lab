@@ -1,0 +1,174 @@
+---
+title: "Pre-processing of CODEX data"
+output:
+  html_document:
+    df_print: paged
+---
+
+## load python env
+```{r}
+# Requires python virtual environment for the anndata package
+reticulate::use_virtualenv("venv_scimap/", required=TRUE)
+```
+
+## Load libraries
+```{r,message=F,warning=F}
+library(Seurat)
+library(ggplot2)
+library(anndata)
+library(dplyr)
+library(Matrix)
+library(sf)
+library(tmap)
+source("utils/R_utils.R")
+```
+
+## Load and prepare files 
+
+For each experiment requires:
+-.h5ad generated from pathml or tissuumaps (edit pattern if necessary)
+- regions.json files generated from tissuumaps (files should be named "regions_exp_name.json")
+
+```{r,eval=T,fig.width=7,fig.height=7}
+#path of processed data 
+proc_path <- 'path_to_experiment_folder' 
+#get list of exp
+exp_list<- list.dirs(proc_path,full.names = F,recursive = F)
+# Ratio of pixel to mm to convert the area to mm2
+pixel_to_mm=0.000325
+codexes<- lapply(exp_list,function(exp){
+  cat("############################ \n\n\n")
+  print(exp)
+  # Load anndata
+  print("loading anndata")
+  codex_nuc<- anndata::read_h5ad(list.files(full.names = T,path = paste0(proc_path,exp),pattern = 'compatible.h5ad')) # edit the pattern according to your own .h5ad
+
+  # Extract Matrix
+  mat <- codex_nuc$T$X
+
+  # Edit channels names 
+  print("Loading and editing channels names")
+  var_names <- paste0(codex_nuc$var_names,"_nuc")
+  
+  # Edit according to your own channel names
+  var_names <- gsub("GZMB-D6E9W",replacement = "GZMB",var_names)
+  var_names <- gsub("MHC1",replacement = "MHC-1",var_names)
+  var_names <- gsub("Cl-Caspase3",replacement = "cl-Caspase",var_names)
+  rownames(mat) <- var_names
+  cell_names <- make.unique(rep(exp,ncol(mat)))
+  colnames(mat) <- cell_names
+  
+  # Get cells within boundaries
+  cat("Loading tissue regions\n")
+  region_pattern <- paste0("regions_",exp,".json")
+  json_path <- paste0(proc_path,exp,"/",region_pattern)
+  if(!file.exists(json_path)){
+    stop(paste0("Regions file not found \nExpected: ",json_path))
+  }
+  json_data <- rjson::fromJSON(file=json_path)
+
+  cell_df<- as.data.frame(cbind(codex_nuc$obsm$spatial[,1],codex_nuc$obsm$spatial[,2]),row.names = cell_names)
+  colnames(cell_df) <- c('x','y')
+  
+  # Initialize variables
+  cell_ids_to_keep <- c()
+  area <- 0
+  poly_list <- list()
+  cell_df$area_id <- NA 
+  for (i in 1:length(json_data$features)){
+    polygon_coords <- t(as.data.frame(json_data$features[[i]]$geometry$coordinates))
+    polygon_coords <- rbind(polygon_coords, polygon_coords[1,]) # close the polygon
+    colnames(polygon_coords) <- c("x", "y")
+    
+    poly <- list(polygon_coords) %>% st_polygon
+    add_area <- round(st_area(poly*pixel_to_mm), digits=2)
+    area <- area + add_area
+    
+    in_pol <- sp::point.in.polygon(cell_df$x, cell_df$y, polygon_coords[,1], polygon_coords[,2])
+    new_cell_ids_to_keep <- rownames(cell_df)[!!in_pol]
+    
+    cell_ids_to_keep <- append(cell_ids_to_keep, new_cell_ids_to_keep)
+    poly_list[[i]] <- poly
+    cell_df$area_id[in_pol==1] <- i  
+  }
+  # Create an sfc object from the list of polygons
+  all_polygons_sfc <- st_sfc(poly_list)
+  
+  # Combine into a single sf object, no CRS assigned
+  all_polygons_sf <- st_sf(geometry = all_polygons_sfc)
+  points_sf <- st_as_sf(cell_df[cell_ids_to_keep,], coords = c("x", "y"))
+  # Plot all polygons and points in a single plot
+  p <- ggplot() +
+    geom_sf(data = all_polygons_sf, color = "blue", fill = NA, size = 2) +
+    geom_sf(data = points_sf, color =  viridis::turbo(10)[points_sf$area_id], size = 0.1)+
+     theme_minimal() +
+      labs(x = 'X', y = 'Y', title = paste0(exp,", ",length(json_data$features)," area(s)", ", surface: ",area, "mm2"),subtitle = paste0("n= ",length(cell_ids_to_keep)," cells"))
+  
+  plot(p)
+  
+  print(paste0("Total area: ",area," mm2"))
+
+  # Filter out cells outside of the selected area
+  mat <- mat[,cell_ids_to_keep]
+  
+  # Create Seurat object
+  codex <- CreateSeuratObject(counts = mat,assay = "MFI",project = exp)
+  
+  # Add spatial coords and meta data
+  codex <- AddMetaData(codex,col.name = "x", cell_df[cell_ids_to_keep,"x"])
+  codex <- AddMetaData(codex,col.name = "y", cell_df[cell_ids_to_keep,'y'])
+  codex@misc$area <- area
+
+  # Rename cells 
+  codex <- RenameCells(codex,new.names =cell_ids_to_keep)
+  
+  # Get zscores values
+  zscores <- scale(t(mat)) 
+  # Clip values to limit range to -5 and +5 
+  zscores<-  myClip(zscores,-5,5)
+  rownames(zscores) <- cell_ids_to_keep
+  
+  # Identify marker that are mostly noise
+  sdss <-setNames(rowSds(mat),rownames(mat))
+  quntiles <- rowQuantiles(mat,probs = c(0.005,0.995))
+  
+  # top 5/1000 should be at least 2x bigger as bottom 995/1000
+  # names(which((toto[,2]/toto[,1] >2) ==F))
+  
+  # OR 
+  # top 5/1000 Should be at least 1 sd between top and bottom 
+  to_neg <- names(which(quntiles[,2]-quntiles[,1] < sdss))
+  
+  if(length(to_neg) >=1){
+    # Turn to negative each channels identified as very low sd
+    to_neg_text <- paste(to_neg, collapse = '\n')
+    cat("Less than one SD between extreme values detected \nSetting negative values for channels:\n", to_neg_text, sep="") 
+    zscores[,to_neg] <- -abs(zscores[,to_neg])
+  }
+  zscore_assay <- CreateAssayObject(counts = t(zscores))
+  codex$orig.ident <- stringr::str_split_i(colnames(codex),pattern = "\\.",1)
+  # add this assay to the previously created Seurat object
+  codex[["zscores"]] <- zscore_assay
+  DefaultAssay(codex) <- "zscores"
+  return(codex)
+})
+```
+
+## Aggregate expeeriments
+```{r,eval=T}
+codex_combined <- merge(codexes[[1]], y =codexes[2:length(codexes)])
+
+# Add spatal coordinates as reduction
+spatialcoords <- as.matrix(codex_combined@meta.data[,c("x",'y')])
+colnames(spatialcoords) <- paste0("spatial_coords", 1:2)
+codex_combined@reductions[["spatial_"]] <- CreateDimReducObject(embeddings =spatialcoords , key = "spatial_", assay = DefaultAssay(codex_combined))
+
+# Add area info 
+names(codexes) <- unique(codex_combined$orig.ident)
+for(sample_id in unique(codex_combined$orig.ident)){
+  print(sample_id)
+  codex_combined@misc$areas[sample_id] <- codexes[[sample_id]]@misc$area
+}
+
+saveRDS(codex_combined,'Path_to_saved_object.rds')
+```
